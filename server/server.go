@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/CyCoreSystems/ari-proxy/v5/messagebus"
@@ -37,6 +38,11 @@ type Server struct {
 	Dialog dialog.Manager
 
 	readyCh chan struct{}
+
+	// lastEventAt holds the UnixNano timestamp of the most recently received ARI
+	// event. It is stamped by runEventHandler and read by runEntityChecker as part
+	// of the event-plane liveness watchdog. Accessed atomically.
+	lastEventAt atomic.Int64
 
 	// cancel is the context cancel function, by which all subtended subscriptions may be terminated
 	cancel context.CancelFunc
@@ -207,8 +213,11 @@ func (s *Server) listen(ctx context.Context) error {
 	// Run the entity check handler
 	go s.runEntityChecker(ctx)
 
-	// TODO: run the dialog cleanup routine (remove bindings for entities which no longer exist)
-	// go s.runDialogCleaner(ctx)
+	// Run the dialog cleanup routine: unbind dialogs for entities which have
+	// signalled end-of-life (StasisEnd / *Destroyed), so a vanished manager's
+	// dialog bindings do not leak forever. Required hygiene before running 2+
+	// managers against the same proxy.
+	go s.runDialogCleaner(ctx)
 
 	// Close the readyChannel to indicate that we are operational
 	if s.readyCh != nil {
@@ -220,10 +229,31 @@ func (s *Server) listen(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// runEntityChecker runs the periodic check againt Asterisk entity id
+// eventPlaneFailureTolerance is the number of consecutive watchdog ticks the
+// native ARI event websocket may report as disconnected before runEntityChecker
+// gives up and exits. At proxy.EntityCheckInterval (10s) this is ~30s of
+// sustained loss, which lets the native client's own re-dial loop recover from a
+// single transient blip without us crash-looping the sidecar.
+const eventPlaneFailureTolerance = 3
+
+// runEntityChecker runs the periodic check against the Asterisk entity id and
+// acts as the liveness watchdog for the native ARI event plane.
+//
+// The HTTP control plane (Asterisk().Info) and the event websocket are
+// independent: the event socket can silently half-die (no StasisStart events
+// reach NATS) while Info() keeps succeeding, with no recovery, until the sidecar
+// is restarted. To guard that, in addition to verifying the entity id we treat a
+// lost event-websocket connection (native Client.Connected() == false) as a
+// failure. We only os.Exit(1) after eventPlaneFailureTolerance consecutive
+// failing ticks so a single transient blip — which the native client's own
+// re-dial loop will heal — does not crash-loop the process. On exit, Kubernetes
+// (or systemd with Restart=on-failure) restarts the sidecar, which re-opens the
+// websocket and resumes publishing.
 func (s *Server) runEntityChecker(ctx context.Context) {
 	ticker := time.NewTicker(proxy.EntityCheckInterval)
 	defer ticker.Stop()
+
+	var eventPlaneFailures int
 
 	for {
 		select {
@@ -240,6 +270,69 @@ func (s *Server) runEntityChecker(ctx context.Context) {
 				// We need to exit with non-zero to make sure systemd restarts when service defined with Restart=on-failure
 				os.Exit(1)
 			}
+
+			// Event-plane liveness check. Connected() reflects the health of the
+			// native event websocket; when it goes false the event pipeline is
+			// down and no events are reaching NATS.
+			if s.ari.Connected() {
+				if eventPlaneFailures > 0 {
+					s.Log.Info("ARI event websocket recovered", "failures", eventPlaneFailures)
+				}
+				eventPlaneFailures = 0
+				continue
+			}
+
+			eventPlaneFailures++
+			s.Log.Warn("ARI event websocket reports disconnected",
+				"failures", eventPlaneFailures,
+				"tolerance", eventPlaneFailureTolerance,
+				"lastEventAgo", s.timeSinceLastEvent())
+			if eventPlaneFailures >= eventPlaneFailureTolerance {
+				s.Log.Error("ARI event plane down for sustained period; exiting so the sidecar is restarted",
+					"failures", eventPlaneFailures)
+				// Non-zero exit so Kubernetes/systemd restarts the sidecar, which
+				// re-opens the event websocket and resumes publishing to NATS.
+				os.Exit(1)
+			}
+		}
+	}
+}
+
+// timeSinceLastEvent returns how long ago the last ARI event was received, for
+// diagnostic logging. Returns a sentinel when no event has been seen yet.
+func (s *Server) timeSinceLastEvent() time.Duration {
+	last := s.lastEventAt.Load()
+	if last == 0 {
+		return -1
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+// dialogCleanInterval is how often runDialogCleaner runs its sweep.
+var dialogCleanInterval = time.Minute
+
+// runDialogCleaner is the periodic dialog-binding cleanup routine. The bulk of
+// cleanup is event-driven (see cleanupDialogsForEvent), which unbinds an entity's
+// dialogs the moment that entity is destroyed; that is the conservative,
+// never-unbind-a-live-dialog path. This routine is the periodic backstop hook.
+//
+// The dialog.Manager interface exposes no way to enumerate existing bindings, so
+// a time-based GC of "orphaned" bindings cannot be implemented safely without
+// extending that interface — and unbinding by guesswork would risk severing a
+// live dialog, which is explicitly worse than a leaked binding. We therefore keep
+// this routine conservative: it runs on the same lifecycle as the other
+// background workers and is the single place to extend should the Manager later
+// gain enumeration. It performs no unbinding itself today.
+func (s *Server) runDialogCleaner(ctx context.Context) {
+	ticker := time.NewTicker(dialogCleanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.Log.Debug("dialog cleaner sweep (event-driven unbind is primary)")
 		}
 	}
 }
@@ -267,21 +360,39 @@ func (s *Server) announce() {
 	})
 }
 
-// runEventHandler processes events which are received from ARI
+// runEventHandler processes events which are received from ARI.
+//
+// If the underlying subscription channel is ever closed (which can happen if the
+// event websocket is torn down), we re-subscribe in place rather than spinning on
+// a permanently-closed channel. This is the preferred low-risk self-heal for the
+// event plane; the runEntityChecker watchdog is the backstop for a websocket that
+// half-dies without ever closing this channel.
 func (s *Server) runEventHandler(ctx context.Context) {
 	sub := s.ari.Bus().Subscribe(nil, ari.Events.All)
-	defer sub.Cancel()
+	defer func() { sub.Cancel() }()
 
 	for {
 		s.Log.Debug("listening for events", "application", s.Application)
 		select {
 		case <-ctx.Done():
 			return
-		case e := <-sub.Events():
+		case e, ok := <-sub.Events():
+			if !ok {
+				// The subscription channel was closed; re-subscribe so we keep
+				// publishing events instead of busy-looping on a dead channel.
+				s.Log.Warn("ARI event subscription channel closed; re-subscribing")
+				sub.Cancel()
+				sub = s.ari.Bus().Subscribe(nil, ari.Events.All)
+				continue
+			}
+			s.lastEventAt.Store(time.Now().UnixNano())
 			s.Log.Debug("event received", "kind", e.GetType())
 
 			// Publish event to canonical destination
 			s.publishEvent(fmt.Sprintf("%sevent.%s.%s", s.MBPrefix, s.Application, s.AsteriskID), e)
+
+			// Unbind dialogs once their entity has ended, so bindings do not leak.
+			s.cleanupDialogsForEvent(e)
 
 			// Publish event to any associated dialogs
 			for _, d := range s.dialogsForEvent(e) {
