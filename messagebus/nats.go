@@ -2,6 +2,7 @@ package messagebus
 
 import (
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/CyCoreSystems/ari-proxy/v5/proxy"
@@ -19,6 +20,11 @@ type NatsBus struct {
 
 	conn          *nats.EncodedConn
 	countTimeouts int64
+
+	// closing is set true at the start of Close() so the ClosedHandler can tell
+	// an intentional teardown apart from a terminal/unexpected close and skip the
+	// os.Exit(1) in the former case.
+	closing atomic.Bool
 }
 
 // OptionNatsFunc options for RabbitMQ
@@ -79,9 +85,12 @@ func WithNatsConn(nconn *nats.EncodedConn) OptionNatsFunc {
 //   - PingInterval(20s) + MaxPingsOutstanding(2): detect a half-open connection in
 //     ~40s instead of ~6m.
 //   - Disconnect/Reconnect/Closed handlers that log the transition. The Closed
-//     handler additionally os.Exit(1)s (belt-and-suspenders — with
-//     MaxReconnects(-1) it should never fire) so Kubernetes restarts the sidecar,
-//     mirroring the os.Exit(1) self-heal pattern in server.runEntityChecker.
+//     handler os.Exit(1)s on a terminal/unexpected close so Kubernetes restarts
+//     the sidecar, mirroring the os.Exit(1) self-heal pattern in
+//     server.runEntityChecker. With MaxReconnects(-1) the connection should never
+//     go terminal-CLOSED on its own, so in practice the only way ClosedCB fires is
+//     an intentional NatsBus.Close() — which sets the closing flag so the handler
+//     skips the exit.
 func (n *NatsBus) connectOptions() []nats.Option {
 	return []nats.Option{
 		nats.MaxReconnects(-1),
@@ -96,9 +105,16 @@ func (n *NatsBus) connectOptions() []nats.Option {
 			n.Log.Info("NATS reconnected", "url", nc.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
-			// Should be unreachable with MaxReconnects(-1). If we ever get here
-			// the connection is terminally dead; exit non-zero so Kubernetes/
-			// systemd restarts the sidecar and re-establishes the bus.
+			// NATS fires ClosedCB unconditionally on Conn.Close(), including a
+			// graceful NatsBus.Close(). Only a terminal/unexpected close should
+			// restart the sidecar, so skip the exit when we triggered the close
+			// ourselves (closing was set before n.conn.Close()).
+			if n.closing.Load() {
+				n.Log.Info("NATS connection closed during intentional shutdown")
+				return
+			}
+			// Terminal/unexpected close: exit non-zero so Kubernetes/systemd
+			// restarts the sidecar and re-establishes the bus.
 			n.Log.Error("NATS connection closed permanently; exiting so the sidecar is restarted")
 			os.Exit(1)
 		}),
@@ -192,8 +208,11 @@ func (n *NatsBus) PublishEvent(topic string, msg ari.Event) error {
 	return n.conn.Publish(topic, msg)
 }
 
-// Close closes the connection
+// Close closes the connection. It marks the bus as intentionally closing first
+// so the ClosedHandler, which NATS fires on Conn.Close(), does not treat this
+// graceful teardown as a terminal failure and os.Exit(1).
 func (n *NatsBus) Close() {
+	n.closing.Store(true)
 	if n.conn != nil {
 		n.conn.Close()
 	}

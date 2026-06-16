@@ -27,3 +27,13 @@ func TestIsConnectedNilConn(t *testing.T) {
 	n := &NatsBus{}
 	assert.False(t, n.IsConnected(), "a NatsBus with no connection is not connected")
 }
+
+func TestCloseMarksClosing(t *testing.T) {
+	// Close() must set the closing flag (before touching the conn) so the
+	// ClosedHandler skips its os.Exit(1) on a graceful teardown. conn is nil
+	// here, so Close() is a no-op beyond setting the flag.
+	n := &NatsBus{}
+	assert.False(t, n.closing.Load(), "closing must start false")
+	n.Close()
+	assert.True(t, n.closing.Load(), "Close() must set closing=true so the ClosedHandler skips os.Exit(1)")
+}
