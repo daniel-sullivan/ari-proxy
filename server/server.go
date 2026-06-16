@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sync/atomic"
 	"time"
@@ -219,6 +220,12 @@ func (s *Server) listen(ctx context.Context) error {
 	// managers against the same proxy.
 	go s.runDialogCleaner(ctx)
 
+	// Run the health endpoint (readiness probe target). It reports 200 only
+	// while BOTH the native ARI event plane and the message bus are connected,
+	// so a pod whose NATS session has silently died goes NotReady and the
+	// kamailio dispatcher / k8s endpoints drop it (fail-closed).
+	go s.runHealthServer(ctx)
+
 	// Close the readyChannel to indicate that we are operational
 	if s.readyCh != nil {
 		close(s.readyCh)
@@ -334,6 +341,49 @@ func (s *Server) runDialogCleaner(ctx context.Context) {
 		case <-ticker.C:
 			s.Log.Debug("dialog cleaner sweep (event-driven unbind is primary)")
 		}
+	}
+}
+
+// healthAddr is the listen address for the readiness/liveness health endpoint.
+const healthAddr = ":8089"
+
+// runHealthServer serves a tiny HTTP health endpoint on healthAddr. GET /healthz
+// returns 200 only when BOTH the native ARI event websocket (s.ari.Connected())
+// AND the message bus (s.mbus.IsConnected()) are connected; otherwise 503. This
+// is the target for a Kubernetes readiness probe so a pod with a half-dead NATS
+// session — which the watchdogs would otherwise let linger — is marked NotReady
+// and removed from service endpoints (fail-closed).
+func (s *Server) runHealthServer(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		ariOK := s.ari != nil && s.ari.Connected()
+		busOK := s.mbus != nil && s.mbus.IsConnected()
+		if ariOK && busOK {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, "unhealthy: ari=%t bus=%t", ariOK, busOK)
+	})
+
+	srv := &http.Server{
+		Addr:              healthAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// Shut the server down when the listener context is cancelled.
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	s.Log.Info("starting health endpoint", "addr", healthAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.Log.Error("health endpoint failed", "error", err)
 	}
 }
 

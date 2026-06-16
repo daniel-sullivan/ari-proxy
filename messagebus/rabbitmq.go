@@ -107,6 +107,13 @@ func (r *RabbitmqBus) Connect() error {
 	return nil
 }
 
+// IsConnected reports whether the RabbitMQ connection is currently established.
+func (r *RabbitmqBus) IsConnected() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.conn != nil && !r.conn.IsClosed()
+}
+
 // SubscribePing subscribe ping messages
 func (r *RabbitmqBus) SubscribePing(topic string, callback PingHandler) (Subscription, error) {
 

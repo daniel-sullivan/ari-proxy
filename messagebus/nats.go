@@ -1,6 +1,7 @@
 package messagebus
 
 import (
+	"os"
 	"time"
 
 	"github.com/CyCoreSystems/ari-proxy/v5/proxy"
@@ -60,14 +61,59 @@ func WithNatsConn(nconn *nats.EncodedConn) OptionNatsFunc {
 	}
 }
 
+// connectOptions builds the NATS connection options for the proxy.
+//
+// The stock ari-proxy called nats.Connect with no options, so NATS defaults
+// applied: MaxReconnects=60 (after 60 failed reconnects the connection goes
+// terminal-CLOSED and never retries or resubscribes) and PingInterval=2m (a
+// half-open connection takes ~6m to detect). With no Closed/Disconnect/Reconnect
+// handlers either, a dead NATS session was completely invisible — which is how
+// the dev split-brain went unnoticed.
+//
+// We therefore:
+//   - MaxReconnects(-1): reconnect forever, so the connection NEVER becomes
+//     terminal-CLOSED. nats.go auto-resubscribes all existing subscriptions
+//     (the ari.* subjects created in server.listen()) on every reconnect, so no
+//     manual resubscribe is needed.
+//   - ReconnectWait + ReconnectJitter: bounded backoff between reconnect attempts.
+//   - PingInterval(20s) + MaxPingsOutstanding(2): detect a half-open connection in
+//     ~40s instead of ~6m.
+//   - Disconnect/Reconnect/Closed handlers that log the transition. The Closed
+//     handler additionally os.Exit(1)s (belt-and-suspenders — with
+//     MaxReconnects(-1) it should never fire) so Kubernetes restarts the sidecar,
+//     mirroring the os.Exit(1) self-heal pattern in server.runEntityChecker.
+func (n *NatsBus) connectOptions() []nats.Option {
+	return []nats.Option{
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2 * time.Second),
+		nats.ReconnectJitter(100*time.Millisecond, 1*time.Second),
+		nats.PingInterval(20 * time.Second),
+		nats.MaxPingsOutstanding(2),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			n.Log.Warn("NATS disconnected", "error", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			n.Log.Info("NATS reconnected", "url", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			// Should be unreachable with MaxReconnects(-1). If we ever get here
+			// the connection is terminally dead; exit non-zero so Kubernetes/
+			// systemd restarts the sidecar and re-establishes the bus.
+			n.Log.Error("NATS connection closed permanently; exiting so the sidecar is restarted")
+			os.Exit(1)
+		}),
+	}
+}
+
 // Connect creates a NATS connection
 func (n *NatsBus) Connect() error {
-	nc, err := nats.Connect(n.Config.URL)
+	opts := n.connectOptions()
+	nc, err := nats.Connect(n.Config.URL, opts...)
 	reconnectionAttempts := DefaultReconnectionAttemts
 	for err == nats.ErrNoServers && reconnectionAttempts > 0 {
 		n.Log.Info("retrying to connect to NATS server", "attempts", reconnectionAttempts)
 		time.Sleep(DefaultReconnectionWait)
-		nc, err = nats.Connect(n.Config.URL)
+		nc, err = nats.Connect(n.Config.URL, opts...)
 		reconnectionAttempts--
 	}
 	if err != nil {
@@ -151,6 +197,13 @@ func (n *NatsBus) Close() {
 	if n.conn != nil {
 		n.conn.Close()
 	}
+}
+
+// IsConnected reports whether the NATS connection is currently established. It
+// is false while reconnecting or before the initial connect, and is used by the
+// health endpoint so a zombie-NATS pod can be marked NotReady.
+func (n *NatsBus) IsConnected() bool {
+	return n.conn != nil && n.conn.Conn != nil && n.conn.Conn.IsConnected()
 }
 
 // GetWildcardString returns wildcard based on type
