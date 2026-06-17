@@ -41,6 +41,11 @@ type Server interface {
 	Connect() error
 	Close()
 
+	// IsConnected reports whether the underlying message-bus connection is
+	// currently established. Used by the health endpoint so a pod whose bus
+	// connection has died can be reported NotReady.
+	IsConnected() bool
+
 	SubscribePing(topic string, callback PingHandler) (Subscription, error)
 	SubscribeRequest(topic string, callback RequestHandler) (Subscription, error)
 	SubscribeRequests(topics []string, callback RequestHandler) (Subscription, error)
