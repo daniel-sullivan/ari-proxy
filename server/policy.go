@@ -93,6 +93,9 @@ func (p *ManagerProfile) Authorize(ctx context.Context, route Route, req *proxy.
 	if route.Class != check.class {
 		return nil, fmt.Errorf("kind %q not permitted on %q subjects", req.Kind, route.Class)
 	}
+	if check.payload != "" && reflect.ValueOf(req).Elem().FieldByName(check.payload).IsNil() {
+		return nil, fmt.Errorf("kind %q is missing its %s payload", req.Kind, check.payload)
+	}
 	if extra := otherPayload(req, check.payload); extra != "" {
 		return nil, fmt.Errorf("kind %q carries unexpected payload %s", req.Kind, extra)
 	}
