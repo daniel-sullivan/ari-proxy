@@ -79,7 +79,7 @@ type healthFixture struct {
 	clock *fakeClock
 }
 
-func newHealthFixture(t *testing.T, entityID string, prober LivenessProber, connected bool) healthFixture {
+func newHealthFixture(t *testing.T, entityID string, prober LivenessProber) healthFixture {
 	t.Helper()
 	ast := &arimocks.Asterisk{}
 	info := &ari.AsteriskInfo{}
@@ -87,7 +87,6 @@ func newHealthFixture(t *testing.T, entityID string, prober LivenessProber, conn
 	ast.On("Info", (*ari.Key)(nil)).Return(info, nil)
 	native := &arimocks.Client{}
 	native.On("Asterisk").Return(ast)
-	native.On("Connected").Return(connected)
 	bus := &recordingBus{}
 	s := testServer(native, bus)
 	s.Dialog = dialog.NewMemManager()
@@ -96,6 +95,7 @@ func newHealthFixture(t *testing.T, entityID string, prober LivenessProber, conn
 	}
 	clock := &fakeClock{now: time.Unix(1_800_000_000, 0)}
 	s.now = clock.Now
+	s.after = neverFires
 	return healthFixture{s: s, bus: bus, clock: clock}
 }
 
@@ -111,21 +111,17 @@ func TestCheckHealthLiveness(t *testing.T) {
 		name string
 		run  func(t *testing.T)
 	}{
-		{name: "supplied client without prober: connected is healthy", run: func(t *testing.T) {
-			f := newHealthFixture(t, testNode, nil, true)
-			assert.True(t, f.tick())
-		}},
-		{name: "supplied client without prober: disconnected is a failure", run: func(t *testing.T) {
-			f := newHealthFixture(t, testNode, nil, false)
+		{name: "no prober is a failure", run: func(t *testing.T) {
+			f := newHealthFixture(t, testNode, nil)
 			assert.False(t, f.tick())
 		}},
 		{name: "entity change is a failure", run: func(t *testing.T) {
-			f := newHealthFixture(t, "other-node", &fakeProber{}, true)
+			f := newHealthFixture(t, "other-node", &fakeProber{})
 			assert.False(t, f.tick())
 		}},
 		{name: "delivered probes keep the proxy healthy and stay off the bus", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			for i := 0; i < 3; i++ {
 				require.True(t, f.tick())
 				f.s.handleEvent(probeEvent(p.last()))
@@ -135,14 +131,14 @@ func TestCheckHealthLiveness(t *testing.T) {
 		}},
 		{name: "undelivered probe is lost once its window from acceptance has passed", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			require.True(t, f.tick())
 			f.s.handleEvent(&ari.StasisStart{Channel: ari.ChannelData{ID: "c1"}}) // other traffic proves nothing
 			assert.False(t, f.tick())
 		}},
 		{name: "probe accepted just before the next tick gets its full window", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			// Asterisk accepts the probe just before the next tick is due.
 			p.onProbe = func(string) { f.clock.Advance(livenessDeliveryWindow - time.Nanosecond) }
 			require.True(t, f.tick())
@@ -158,7 +154,7 @@ func TestCheckHealthLiveness(t *testing.T) {
 		}},
 		{name: "late-accepted probe still fails when its own window passes", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			p.onProbe = func(string) { f.clock.Advance(livenessDeliveryWindow - time.Nanosecond) }
 			require.True(t, f.tick())
 			p.onProbe = nil
@@ -168,7 +164,7 @@ func TestCheckHealthLiveness(t *testing.T) {
 		}},
 		{name: "delivery that races the probe reply counts", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			p.onProbe = func(nonce string) { f.s.handleEvent(probeEvent(nonce)) }
 			require.True(t, f.tick())
 			assert.True(t, f.tick())
@@ -176,7 +172,7 @@ func TestCheckHealthLiveness(t *testing.T) {
 		}},
 		{name: "stale nonce is not delivery", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			require.True(t, f.tick())
 			first := p.last()
 			f.s.handleEvent(probeEvent(first))
@@ -186,12 +182,12 @@ func TestCheckHealthLiveness(t *testing.T) {
 		}},
 		{name: "unregistered application is a failure", run: func(t *testing.T) {
 			p := &fakeProber{err: fmt.Errorf("send liveness probe: %w", ErrApplicationNotRegistered)}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			assert.False(t, f.tick())
 		}},
 		{name: "transport failure is not counted and the next tick probes again", run: func(t *testing.T) {
 			p := &fakeProber{err: errors.New("dial tcp: connection refused")}
-			f := newHealthFixture(t, testNode, p, true)
+			f := newHealthFixture(t, testNode, p)
 			assert.True(t, f.tick())
 			assert.True(t, f.tick())
 			assert.Equal(t, 2, p.count())

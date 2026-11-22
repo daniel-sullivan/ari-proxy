@@ -20,6 +20,15 @@ func (allowAll) Authorize(_ context.Context, _ server.Route, req *proxy.Request)
 	return req, nil
 }
 
+// unsentProber stands in for the ARI liveness probe in the integration
+// suite, whose mock clients have no event websocket. A probe that is never
+// sent is not counted, so the watchdog stays quiet.
+type unsentProber struct{}
+
+func (unsentProber) Probe(context.Context, string) error {
+	return errors.New("integration suite: liveness probe not sent")
+}
+
 type srv struct {
 	s *server.Server
 }
@@ -28,6 +37,7 @@ func (s *srv) Start(ctx context.Context, t *testing.T, mockClient ari.Client, nc
 	s.s = server.New()
 	// The integration suite exercises the whole ARI surface.
 	s.s.Authorizer = allowAll{}
+	s.s.Prober = unsentProber{}
 
 	// tests may run in parallel so we don't want two separate proxy servers to conflict.
 	s.s.MBPrefix = rid.New("") + "."
