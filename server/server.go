@@ -222,7 +222,7 @@ func (s *Server) listen(ctx context.Context) error {
 	if err != nil {
 		return eris.Wrap(err, "failed to subscribe to pings")
 	}
-	defer wg.Add(testPingSub.Unsubscribe)
+	defer wg.Add(testPingSub.Unsubscribe)()
 
 	// get a contextualized request handler
 	requestHandler := s.newRequestHandler(ctx)
