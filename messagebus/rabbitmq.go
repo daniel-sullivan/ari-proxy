@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/CyCoreSystems/ari-proxy/v5/proxy"
@@ -42,7 +43,8 @@ type RabbitmqBus struct {
 	conn          *amqp091.Connection
 	channel       *amqp091.Channel
 	countTimeouts int64
-	isClosed      bool
+	isClosed      atomic.Bool
+	done          chan struct{}
 	mu            sync.RWMutex
 }
 
@@ -72,9 +74,8 @@ func WithRabbitmqConn(rconn *amqp091.Connection) OptionRabbitmqFunc {
 
 // Connect creates a NATS connection
 func (r *RabbitmqBus) Connect() error {
-	if r.isClosed {
-		r.isClosed = false
-	}
+	r.isClosed.Store(false)
+	r.done = make(chan struct{})
 
 	if err := r.connect(); err != nil {
 		return err
@@ -85,21 +86,30 @@ func (r *RabbitmqBus) Connect() error {
 		for {
 			reason, ok := <-r.conn.NotifyClose(make(chan *amqp091.Error))
 			if !ok {
-				if r.isClosed {
+				if r.isClosed.Load() {
 					return
 				}
 				r.Log.Error("connection unexpected closed", "reason", reason)
 
-				r.mu.Lock()
 				for {
-					if connErr := r.connect(); connErr != nil {
+					r.mu.Lock()
+					if r.isClosed.Load() {
+						r.mu.Unlock()
+						return
+					}
+					connErr := r.connect()
+					r.mu.Unlock()
+					if connErr != nil {
 						r.Log.Error("connection failed, trying to reconnect", "err", connErr)
-						time.Sleep(DefaultReconnectionWait)
+						select {
+						case <-r.done:
+							return
+						case <-time.After(DefaultReconnectionWait):
+						}
 						continue
 					}
 					break
 				}
-				r.mu.Unlock()
 			}
 		}
 	}()
@@ -111,6 +121,7 @@ func (r *RabbitmqBus) Connect() error {
 func (r *RabbitmqBus) SubscribePing(topic string, callback PingHandler) (Subscription, error) {
 
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       []string{topic},
 		Queue:        exchangePing + "-" + rid.New(ridQueue),
 		Exchange:     exchangePing,
@@ -132,10 +143,13 @@ func (r *RabbitmqBus) SubscribePing(topic string, callback PingHandler) (Subscri
 				}
 				callback()
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -146,6 +160,7 @@ func (r *RabbitmqBus) SubscribePing(topic string, callback PingHandler) (Subscri
 func (r *RabbitmqBus) SubscribeRequest(topic string, callback RequestHandler) (Subscription, error) {
 
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       []string{topic},
 		Queue:        topic + "-" + rid.New(ridQueue),
 		Exchange:     exchangeRequest,
@@ -175,10 +190,13 @@ func (r *RabbitmqBus) SubscribeRequest(topic string, callback RequestHandler) (S
 				}
 				callback(topic, msg.ReplyTo, &data)
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -189,6 +207,7 @@ func (r *RabbitmqBus) SubscribeRequest(topic string, callback RequestHandler) (S
 func (r *RabbitmqBus) SubscribeRequests(topics []string, callback RequestHandler) (Subscription, error) {
 
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       topics,
 		Queue:        rid.New(ridQueue),
 		Exchange:     exchangeRequest,
@@ -218,10 +237,13 @@ func (r *RabbitmqBus) SubscribeRequests(topics []string, callback RequestHandler
 				}
 				callback(msg.RoutingKey, msg.ReplyTo, &data)
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -232,6 +254,7 @@ func (r *RabbitmqBus) SubscribeRequests(topics []string, callback RequestHandler
 func (r *RabbitmqBus) SubscribeAnnounce(topic string, callback AnnounceHandler) (Subscription, error) {
 
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       []string{topic},
 		Queue:        topic + "-" + rid.New(ridQueue),
 		Exchange:     exchangeAnnounce,
@@ -261,10 +284,13 @@ func (r *RabbitmqBus) SubscribeAnnounce(topic string, callback AnnounceHandler) 
 				}
 				callback(&data)
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -275,6 +301,7 @@ func (r *RabbitmqBus) SubscribeAnnounce(topic string, callback AnnounceHandler) 
 func (r *RabbitmqBus) SubscribeEvent(topic string, queue string, callback EventHandler) (Subscription, error) {
 
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       []string{topic},
 		Queue:        queue,
 		Exchange:     exchangeEvent,
@@ -298,10 +325,13 @@ func (r *RabbitmqBus) SubscribeEvent(topic string, queue string, callback EventH
 				//callback
 				callback(msg.Body)
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -311,6 +341,7 @@ func (r *RabbitmqBus) SubscribeEvent(topic string, queue string, callback EventH
 // SubscribeCreateRequest subscribe create request messages
 func (r *RabbitmqBus) SubscribeCreateRequest(topic string, queue string, callback RequestHandler) (Subscription, error) {
 	sub := RmqSubscription{
+		done:         make(chan struct{}),
 		Topics:       []string{topic},
 		Queue:        queue + "-" + topic,
 		Exchange:     exchangeRequest,
@@ -339,10 +370,13 @@ func (r *RabbitmqBus) SubscribeCreateRequest(topic string, queue string, callbac
 				}
 				callback(topic, msg.ReplyTo, &data)
 			}
-			if r.isClosed {
+			if r.isClosed.Load() {
 				return
 			}
 			msgs = sub.reconnect(r)
+			if msgs == nil {
+				return
+			}
 		}
 	}(d)
 
@@ -390,11 +424,18 @@ func (r *RabbitmqBus) PublishEvent(topic string, msg ari.Event) error {
 
 // Close closes the connection
 func (r *RabbitmqBus) Close() {
+	if !r.isClosed.CompareAndSwap(false, true) {
+		return
+	}
+	if r.done != nil {
+		close(r.done)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.isClosed = true
-	r.conn.Close() // nolint: errcheck
+	if r.conn != nil {
+		r.conn.Close() // nolint: errcheck
+	}
 }
 
 // GetWildcardString returns wildcard based on type
@@ -655,13 +696,16 @@ func (r *RabbitmqBus) TimeoutCount() int64 {
 }
 
 func (r *RabbitmqBus) connect() error {
-	var err error
-	if r.conn, err = amqp091.Dial(r.Config.URL); err != nil {
+	conn, err := amqp091.Dial(r.Config.URL)
+	if err != nil {
 		return eris.Wrap(err, "connect")
 	}
-	if r.channel, err = r.conn.Channel(); err != nil {
+	channel, err := conn.Channel()
+	if err != nil {
+		conn.Close() // nolint: errcheck
 		return eris.Wrap(err, "channel create")
 	}
+	r.conn, r.channel = conn, channel
 	return nil
 }
 

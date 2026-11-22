@@ -12,29 +12,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type fakeSubscription struct{ unsubscribed int }
+type fakeSubscription struct {
+	unsubscribed int
+	err          error
+}
 
 func (f *fakeSubscription) Unsubscribe() error {
 	f.unsubscribed++
-	return nil
+	return f.err
 }
 
 // subscribeBus fails the subscription at position failAt (0 ping, 1 requests,
 // 2 first create) and records every subscription it handed out.
 type subscribeBus struct {
 	messagebus.Server
-	failAt int
-	calls  int
-	subs   []*fakeSubscription
+	failAt         int
+	calls          int
+	subs           []*fakeSubscription
+	unsubscribeErr error
+	subscribeErr   error
 }
 
 func (b *subscribeBus) next() (messagebus.Subscription, error) {
 	n := b.calls
 	b.calls++
 	if n == b.failAt {
-		return nil, errors.New("subscribe failed")
+		return nil, b.subscribeErr
 	}
-	sub := &fakeSubscription{}
+	sub := &fakeSubscription{err: b.unsubscribeErr}
 	b.subs = append(b.subs, sub)
 	return sub, nil
 }
@@ -75,13 +80,19 @@ func TestListenEarlyReturnIsClean(t *testing.T) {
 			native := &arimocks.Client{}
 			native.On("Asterisk").Return(ast)
 			native.On("ApplicationName").Return(testApp)
-			bus := &subscribeBus{failAt: tt.failAt}
+			startupErr := errors.New("subscribe failed")
+			bus := &subscribeBus{failAt: tt.failAt, subscribeErr: startupErr, unsubscribeErr: errors.New("unsubscribe failed")}
 			s := testServer(native, bus)
 
 			var err error
 			require.NotPanics(t, func() { err = s.listen(context.Background()) })
 
 			assert.Error(t, err)
+			if tt.infoErr != nil {
+				assert.ErrorIs(t, err, tt.infoErr)
+			} else {
+				assert.ErrorIs(t, err, startupErr)
+			}
 			require.Len(t, bus.subs, tt.wantSubs)
 			for i, sub := range bus.subs {
 				assert.Equal(t, 1, sub.unsubscribed, "subscription %d is unsubscribed once", i)
