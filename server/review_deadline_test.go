@@ -19,8 +19,10 @@ import (
 func neverFires(time.Duration) <-chan time.Time { return nil }
 
 // infoFixture returns a health fixture whose first Asterisk info requests
-// (answered of them) succeed and whose later ones block until the test ends.
-func infoFixture(t *testing.T, answered int, prober LivenessProber) (healthFixture, *arimocks.Asterisk) {
+// (answered of them) succeed. Later ones block until the test ends when hang
+// is set, and otherwise also return at once, so a test that counts calls
+// fails instead of hanging.
+func infoFixture(t *testing.T, answered int, prober LivenessProber, hang bool) (healthFixture, *arimocks.Asterisk) {
 	t.Helper()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -30,7 +32,10 @@ func infoFixture(t *testing.T, answered int, prober LivenessProber) (healthFixtu
 	if answered > 0 {
 		ast.On("Info", (*ari.Key)(nil)).Return(info, nil).Times(answered)
 	}
-	ast.On("Info", (*ari.Key)(nil)).Run(func(mock.Arguments) { <-release }).Return(info, nil)
+	later := ast.On("Info", (*ari.Key)(nil)).Return(info, nil)
+	if hang {
+		later.Run(func(mock.Arguments) { <-release })
+	}
 	native := &arimocks.Client{}
 	native.On("Asterisk").Return(ast)
 	s := testServer(native, &recordingBus{})
@@ -50,7 +55,7 @@ func TestCheckHealthInfoDeadline(t *testing.T) {
 	}{
 		{name: "hung info request is a failure when the liveness window closes", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f, _ := infoFixture(t, 0, p)
+			f, _ := infoFixture(t, 0, p, true)
 			var asked []time.Duration
 			f.s.after = func(d time.Duration) <-chan time.Time {
 				asked = append(asked, d)
@@ -64,16 +69,16 @@ func TestCheckHealthInfoDeadline(t *testing.T) {
 		}},
 		{name: "lost probe is judged before the info request", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f, ast := infoFixture(t, 1, p)
+			f, ast := infoFixture(t, 1, p, false)
 			require.True(t, f.tick())
-			// The next info request would block for ever and the timer never
-			// fires, so only the earlier probe check can end this tick.
+			// A second info request would answer at once and keep the tick
+			// going; the call count shows the probe check ended it first.
 			assert.False(t, f.tick())
 			ast.AssertNumberOfCalls(t, "Info", 1)
 		}},
 		{name: "info answered within the window keeps the watchdog healthy", run: func(t *testing.T) {
 			p := &fakeProber{}
-			f, _ := infoFixture(t, 2, p)
+			f, _ := infoFixture(t, 2, p, false)
 			require.True(t, f.tick())
 			f.s.handleEvent(probeEvent(p.last()))
 			assert.True(t, f.tick())
