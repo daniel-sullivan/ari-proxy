@@ -180,14 +180,11 @@ func (s *Server) Ready() <-chan struct{} {
 func (s *Server) listen(ctx context.Context) error {
 	s.Log.Debug("starting listener")
 
-	var wg closeGroup
-	defer func() {
-		select {
-		case <-wg.Done():
-		case <-time.After(500 * time.Millisecond):
-			panic("timeout waiting for shutdown of sub components")
+	closeSubscription := func(sub messagebus.Subscription) {
+		if err := sub.Unsubscribe(); err != nil {
+			s.Log.Warn("failed to unsubscribe", "error", err)
 		}
-	}()
+	}
 
 	// First, get the Asterisk ID
 
@@ -222,7 +219,7 @@ func (s *Server) listen(ctx context.Context) error {
 	if err != nil {
 		return eris.Wrap(err, "failed to subscribe to pings")
 	}
-	defer wg.Add(testPingSub.Unsubscribe)()
+	defer closeSubscription(testPingSub)
 
 	// get a contextualized request handler
 	requestHandler := s.newRequestHandler(ctx)
@@ -244,24 +241,24 @@ func (s *Server) listen(ctx context.Context) error {
 		s.Log.Error("%v", err)
 		return eris.Wrap(err, "failed to create requests subscription")
 	}
-	defer wg.Add(requestsSub.Unsubscribe)()
+	defer closeSubscription(requestsSub)
 
 	// create handlers
 	allCreate, err := s.mbus.SubscribeCreateRequest(proxy.Subject(s.MBPrefix, "create", "", ""), "ariproxy", requestHandler)
 	if err != nil {
 		return eris.Wrap(err, "failed to create create-all subscription")
 	}
-	defer wg.Add(allCreate.Unsubscribe)()
+	defer closeSubscription(allCreate)
 	appCreate, err := s.mbus.SubscribeCreateRequest(proxy.Subject(s.MBPrefix, "create", s.Application, ""), "ariproxy", requestHandler)
 	if err != nil {
 		return eris.Wrap(err, "failed to create create-app subscription")
 	}
-	defer wg.Add(appCreate.Unsubscribe)()
+	defer closeSubscription(appCreate)
 	idCreate, err := s.mbus.SubscribeCreateRequest(proxy.Subject(s.MBPrefix, "create", s.Application, s.AsteriskID), "ariproxy", requestHandler)
 	if err != nil {
 		return eris.Wrap(err, "failed to create create-id subscription")
 	}
-	defer wg.Add(idCreate.Unsubscribe)()
+	defer closeSubscription(idCreate)
 
 	// Run the periodic announcer
 	go s.runAnnouncer(ctx)
