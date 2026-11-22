@@ -307,12 +307,24 @@ func (s *Server) runEntityChecker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !s.checkHealth(ctx) {
-				s.exitProcess(1)
+			if !s.watchdogTick(ctx) {
 				return
 			}
 		}
 	}
+}
+
+// watchdogTick runs one health check and reports whether the watchdog keeps
+// running. A confirmed failure ends the process, unless the server's context
+// was cancelled meanwhile: a stopping server never ends its embedding process.
+func (s *Server) watchdogTick(ctx context.Context) bool {
+	if s.checkHealth(ctx) {
+		return true
+	}
+	if ctx.Err() == nil {
+		s.exitProcess(1)
+	}
+	return false
 }
 
 // checkHealth runs one watchdog tick. It returns false on a confirmed failure.
@@ -331,8 +343,10 @@ func (s *Server) checkHealth(ctx context.Context) bool {
 		return false
 	}
 
-	info, err := s.infoWithinWindow()
+	info, err := s.infoWithinWindow(ctx)
 	switch {
+	case ctx.Err() != nil:
+		return false
 	case errors.Is(err, errInfoDeadline):
 		s.Log.Error("Asterisk info request did not complete within the liveness window; exiting so the sidecar is restarted")
 		return false
@@ -372,8 +386,8 @@ var errInfoDeadline = errors.New("asterisk info request exceeded the liveness wi
 
 // infoWithinWindow runs the Asterisk info request with the liveness window as its
 // deadline. The native client's request takes no context, so a request that
-// hangs is abandoned; the watchdog then ends the process.
-func (s *Server) infoWithinWindow() (*ari.AsteriskInfo, error) {
+// hangs is abandoned when the window closes or ctx is cancelled.
+func (s *Server) infoWithinWindow(ctx context.Context) (*ari.AsteriskInfo, error) {
 	type result struct {
 		info *ari.AsteriskInfo
 		err  error
@@ -386,6 +400,8 @@ func (s *Server) infoWithinWindow() (*ari.AsteriskInfo, error) {
 	select {
 	case r := <-done:
 		return r.info, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-s.timer(livenessDeliveryWindow):
 		return nil, errInfoDeadline
 	}
