@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"sync/atomic"
 	"time"
@@ -59,12 +58,18 @@ type Server struct {
 	// at listen time, the ManagerProfile for this node is installed.
 	Authorizer Authorizer
 
-	// prober sends the event-plane liveness probe; nil disables it.
-	prober   LivenessProber
+	// Prober sends the event-plane liveness probe. Listen installs an ARI
+	// user-event prober when it is nil. For a server started with ListenOn
+	// and no Prober, the watchdog falls back to the supplied client's
+	// Connected() state.
+	Prober   LivenessProber
 	liveness livenessTracker
 
 	// exit ends the process; nil means os.Exit.
 	exit func(code int)
+
+	// now reads the clock; nil means time.Now.
+	now func() time.Time
 
 	// ManagerMediaHost is the manager membership DNS name used to validate
 	// ExternalMedia peers. It defaults to the ARI_PROXY_MANAGER_MEDIA_HOST
@@ -92,12 +97,22 @@ func (s *Server) Listen(ctx context.Context, ariOpts *native.Options, messagebus
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
+	// native.Connect resolves defaults and environment settings into the
+	// options it is given, so the prober below sees the same settings.
+	if ariOpts == nil {
+		ariOpts = &native.Options{}
+	}
+
 	// Connect to ARI
 	s.ari, err = native.Connect(ariOpts)
 	if err != nil {
 		return eris.Wrap(err, "failed to connect to ARI")
 	}
 	defer s.ari.Close()
+
+	if s.Prober == nil {
+		s.Prober = newUserEventProber(ariOpts, s.ari.ApplicationName())
+	}
 
 	mbtype := messagebus.GetType(messagebusURL)
 	switch mbtype {
@@ -121,18 +136,6 @@ func (s *Server) Listen(ctx context.Context, ariOpts *native.Options, messagebus
 		return eris.Wrap(err, "failed to connect to MessageBus")
 	}
 	defer s.mbus.Close()
-
-	baseURL := ariOpts.URL
-	if baseURL == "" {
-		baseURL = "http://localhost:8088/ari"
-	}
-	s.prober = &ariUserEventProber{
-		baseURL:     baseURL,
-		application: s.ari.ApplicationName(),
-		username:    ariOpts.Username,
-		password:    ariOpts.Password,
-		client:      &http.Client{},
-	}
 
 	return s.listen(ctx)
 }
@@ -308,24 +311,47 @@ func (s *Server) checkHealth(ctx context.Context) bool {
 		return false
 	}
 
-	if s.prober == nil {
+	if s.Prober == nil {
+		if !s.ari.Connected() {
+			s.Log.Error("ARI client reports disconnected; exiting so the sidecar is restarted")
+			return false
+		}
 		return true
 	}
-	if !s.liveness.answered() {
+
+	switch s.liveness.state(s.clock(), livenessDeliveryWindow) {
+	case probeAwaiting:
+		return true
+	case probeLost:
 		s.Log.Error("ARI event websocket did not deliver the liveness probe; exiting so the sidecar is restarted",
 			"lastEventAgo", s.timeSinceLastEvent())
 		return false
 	}
+
 	nonce := rid.New("")
 	s.liveness.expect(nonce)
 	probeCtx, cancel := context.WithTimeout(ctx, proxy.EntityCheckInterval)
 	defer cancel()
-	if err := s.prober.Probe(probeCtx, nonce); err != nil {
+	switch err := s.Prober.Probe(probeCtx, nonce); {
+	case err == nil:
+		s.liveness.accepted(nonce, s.clock())
+	case errors.Is(err, ErrApplicationNotRegistered):
+		s.liveness.clear()
+		s.Log.Error("ARI application is no longer registered; exiting so the sidecar is restarted", "error", err)
+		return false
+	default:
 		// A probe that was never sent says nothing about event delivery.
 		s.liveness.clear()
 		s.Log.Warn("failed to send ARI liveness probe", "error", err)
 	}
 	return true
+}
+
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // exitProcess ends the process so its supervisor restarts the sidecar.
