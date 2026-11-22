@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"github.com/CyCoreSystems/ari-proxy/v5/proxy"
 	"testing"
 	"time"
 
@@ -12,12 +13,21 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// allowAll admits every request unchanged; integration tests only.
+type allowAll struct{}
+
+func (allowAll) Authorize(_ context.Context, _ server.Route, req *proxy.Request) (*proxy.Request, error) {
+	return req, nil
+}
+
 type srv struct {
 	s *server.Server
 }
 
 func (s *srv) Start(ctx context.Context, t *testing.T, mockClient ari.Client, nc *nats.EncodedConn, completeCh chan struct{}) (ari.Client, error) {
 	s.s = server.New()
+	// The integration suite exercises the whole ARI surface.
+	s.s.Authorizer = allowAll{}
 
 	// tests may run in parallel so we don't want two separate proxy servers to conflict.
 	s.s.MBPrefix = rid.New("") + "."

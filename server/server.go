@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,15 @@ type Server struct {
 	Log log15.Logger
 
 	mbus messagebus.Server
+
+	// Authorizer admits or denies every bus request before dispatch. When nil
+	// at listen time, the ManagerProfile for this node is installed.
+	Authorizer Authorizer
+
+	// ManagerMediaHost is the manager membership DNS name used to validate
+	// ExternalMedia peers. It defaults to the ARI_PROXY_MANAGER_MEDIA_HOST
+	// environment variable.
+	ManagerMediaHost string
 }
 
 // New returns a new Server
@@ -63,6 +73,8 @@ func New() *Server {
 		readyCh:  make(chan struct{}),
 		Dialog:   dialog.NewMemManager(),
 		Log:      log,
+
+		ManagerMediaHost: os.Getenv(ManagerMediaHostEnv),
 	}
 }
 
@@ -153,6 +165,15 @@ func (s *Server) listen(ctx context.Context) error {
 
 	// Store the ARI application name for top-level access
 	s.Application = s.ari.ApplicationName()
+
+	if s.Authorizer == nil {
+		s.Authorizer = &ManagerProfile{
+			Application:   s.Application,
+			Node:          s.AsteriskID,
+			MediaPeerHost: s.ManagerMediaHost,
+			Resolver:      net.DefaultResolver,
+		}
+	}
 
 	//
 	// Listen on the initial MessageBus subjects
@@ -439,8 +460,52 @@ func (s *Server) newRequestHandler(ctx context.Context) func(subject string, rep
 			s.sendError(reply, eris.New("ARI connection is down"))
 			return
 		}
-		go s.dispatchRequest(ctx, reply, req)
+		go s.handleRequest(ctx, subject, reply, req)
 	}
+}
+
+// handleRequest authorizes a bus request against the capability profile and
+// dispatches only the request the profile rebuilt. A denied request gets the
+// generic ErrRequestDenied reply and never reaches native ARI.
+func (s *Server) handleRequest(ctx context.Context, subject string, reply string, req *proxy.Request) {
+	accepted, err := s.authorize(ctx, subject, req)
+	if err != nil {
+		kind := ""
+		if req != nil {
+			kind = req.Kind
+		}
+		s.Log.Warn("request denied by capability profile", "subject", subject, "kind", kind, "reason", err)
+		s.sendError(reply, ErrRequestDenied)
+		return
+	}
+	s.dispatchRequest(ctx, reply, accepted)
+}
+
+func (s *Server) authorize(ctx context.Context, subject string, req *proxy.Request) (*proxy.Request, error) {
+	if s.Authorizer == nil {
+		return nil, errors.New("no authorizer configured")
+	}
+	route, ok := s.routeFor(subject)
+	if !ok {
+		return nil, errors.New("unrecognised subject")
+	}
+	return s.Authorizer.Authorize(ctx, route, req)
+}
+
+// routeFor decodes one of the request subjects this server subscribes to.
+func (s *Server) routeFor(subject string) (Route, bool) {
+	for _, class := range []string{"get", "data", "command", "create"} {
+		for _, r := range []Route{
+			{Class: class},
+			{Class: class, App: s.Application},
+			{Class: class, App: s.Application, Node: s.AsteriskID},
+		} {
+			if subject == proxy.Subject(s.MBPrefix, r.Class, r.App, r.Node) {
+				return r, true
+			}
+		}
+	}
+	return Route{}, false
 }
 
 // TODO: see if there is a more programmatic approach to this
