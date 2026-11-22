@@ -8,52 +8,71 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 )
 
-func TestSubscriptionCancelStopsReconnect(t *testing.T) {
+func TestSubscriptionReconnectStopsOnClose(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name         string
 		cancelBefore bool
+		closeBus     bool
 	}{
-		{name: "before reconnect", cancelBefore: true},
-		{name: "during retry wait"},
+		{name: "unsubscribe before reconnect", cancelBefore: true},
+		{name: "unsubscribe during retry wait"},
+		{name: "close bus before reconnect", cancelBefore: true, closeBus: true},
+		{name: "close bus during retry wait", closeBus: true},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			bus := &RabbitmqBus{done: make(chan struct{})}
 			sub := &RmqSubscription{done: make(chan struct{})}
-			attempted := make(chan struct{}, 1)
-			finished := make(chan struct{})
-			if tc.cancelBefore {
+			t.Cleanup(func() {
 				if err := sub.Unsubscribe(); err != nil {
+					t.Error(err)
+				}
+			})
+			cancel := func() {
+				if tc.closeBus {
+					bus.Close()
+				} else if err := sub.Unsubscribe(); err != nil {
 					t.Fatal(err)
 				}
 			}
+			failed := make(chan struct{}, 1)
+			finished := make(chan struct{})
+			attempts := 0
+			if tc.cancelBefore {
+				cancel()
+			}
 			go func() {
 				defer close(finished)
-				sub.retrySubscription(func() (<-chan amqp091.Delivery, error) {
-					attempted <- struct{}{}
+				sub.retrySubscription(bus.done, func() (<-chan amqp091.Delivery, error) {
+					attempts++
 					return nil, errors.New("disconnected")
-				}, func(error) {})
+				}, func(error) {
+					if attempts == 1 {
+						failed <- struct{}{}
+					}
+				})
 			}()
 			if !tc.cancelBefore {
 				select {
-				case <-attempted:
+				case <-failed:
 				case <-time.After(time.Second):
-					t.Fatal("reconnect did not start")
+					t.Fatal("first reconnect attempt did not fail")
 				}
-				if err := sub.Unsubscribe(); err != nil {
-					t.Fatal(err)
-				}
+				cancel()
 			}
 			select {
 			case <-finished:
 			case <-time.After(time.Second):
 				t.Fatal("reconnect did not stop")
 			}
-			select {
-			case <-attempted:
-				t.Fatal("unexpected reconnect attempt")
-			default:
+			wantAttempts := 0
+			if !tc.cancelBefore {
+				wantAttempts = 1
+			}
+			if attempts != wantAttempts {
+				t.Fatalf("reconnect attempts = %d, want %d", attempts, wantAttempts)
 			}
 		})
 	}

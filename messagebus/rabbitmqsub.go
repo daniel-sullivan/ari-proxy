@@ -46,17 +46,19 @@ func (rs *RmqSubscription) reconnect(r *RabbitmqBus) <-chan amqp091.Delivery {
 		rs.channel.Close() // nolint: errcheck
 	}
 	rs.mu.Unlock()
-	return rs.retrySubscription(func() (<-chan amqp091.Delivery, error) {
+	return rs.retrySubscription(r.done, func() (<-chan amqp091.Delivery, error) {
 		return rs.execute(r)
 	}, func(err error) {
 		r.Log.Error("failed to execute subscription", "error", err)
 	})
 }
 
-func (rs *RmqSubscription) retrySubscription(attempt func() (<-chan amqp091.Delivery, error), logError func(error)) <-chan amqp091.Delivery {
+func (rs *RmqSubscription) retrySubscription(busDone <-chan struct{}, attempt func() (<-chan amqp091.Delivery, error), logError func(error)) <-chan amqp091.Delivery {
 	for {
 		select {
 		case <-rs.done:
+			return nil
+		case <-busDone:
 			return nil
 		default:
 		}
@@ -66,6 +68,9 @@ func (rs *RmqSubscription) retrySubscription(attempt func() (<-chan amqp091.Deli
 			timer := time.NewTimer(DefaultReconnectionWait)
 			select {
 			case <-rs.done:
+				timer.Stop()
+				return nil
+			case <-busDone:
 				timer.Stop()
 				return nil
 			case <-timer.C:
