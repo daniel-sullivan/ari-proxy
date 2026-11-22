@@ -367,6 +367,7 @@ type recordingBus struct {
 	messagebus.Server
 	mu      sync.Mutex
 	replies []*proxy.Response
+	events  []string
 }
 
 func (b *recordingBus) PublishResponse(_ string, msg *proxy.Response) error {
@@ -407,6 +408,8 @@ func TestHandleRequestDenialMakesNoDispatch(t *testing.T) {
 			return r
 		}()},
 		{name: "nonmember media", subject: "ari.create.etla.node-a", req: mediaReq(func(o *ari.ExternalMediaOptions) { o.ExternalHost = "10.0.0.1:4000" })},
+		{name: "originate without payload", subject: "ari.create.etla.node-a", req: &proxy.Request{Kind: "ChannelOriginate", Key: nodeKey("", "")}},
+		{name: "external media without payload", subject: "ari.create.etla.node-a", req: &proxy.Request{Kind: "ChannelExternalMedia", Key: nodeKey("", "")}},
 		{name: "variable write", subject: "ari.command.etla.node-a", req: &proxy.Request{Kind: "ChannelVariableSet", Key: nodeKey(ari.ChannelKey, "c1"), ChannelVariable: &proxy.ChannelVariable{Name: "X", Value: "1"}}},
 	}
 	for _, tt := range tests {

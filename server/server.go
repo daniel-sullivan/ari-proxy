@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/CyCoreSystems/ari-proxy/v5/server/dialog"
 	"github.com/CyCoreSystems/ari/v5"
 	"github.com/CyCoreSystems/ari/v5/client/native"
+	"github.com/CyCoreSystems/ari/v5/rid"
 	"github.com/nats-io/nats.go"
 	"github.com/rotisserie/eris"
 
@@ -56,6 +58,13 @@ type Server struct {
 	// Authorizer admits or denies every bus request before dispatch. When nil
 	// at listen time, the ManagerProfile for this node is installed.
 	Authorizer Authorizer
+
+	// prober sends the event-plane liveness probe; nil disables it.
+	prober   LivenessProber
+	liveness livenessTracker
+
+	// exit ends the process; nil means os.Exit.
+	exit func(code int)
 
 	// ManagerMediaHost is the manager membership DNS name used to validate
 	// ExternalMedia peers. It defaults to the ARI_PROXY_MANAGER_MEDIA_HOST
@@ -112,6 +121,18 @@ func (s *Server) Listen(ctx context.Context, ariOpts *native.Options, messagebus
 		return eris.Wrap(err, "failed to connect to MessageBus")
 	}
 	defer s.mbus.Close()
+
+	baseURL := ariOpts.URL
+	if baseURL == "" {
+		baseURL = "http://localhost:8088/ari"
+	}
+	s.prober = &ariUserEventProber{
+		baseURL:     baseURL,
+		application: s.ari.ApplicationName(),
+		username:    ariOpts.Username,
+		password:    ariOpts.Password,
+		client:      &http.Client{},
+	}
 
 	return s.listen(ctx)
 }
@@ -250,73 +271,70 @@ func (s *Server) listen(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// eventPlaneFailureTolerance is the number of consecutive watchdog ticks the
-// native ARI event websocket may report as disconnected before runEntityChecker
-// gives up and exits. At proxy.EntityCheckInterval (10s) this is ~30s of
-// sustained loss, which lets the native client's own re-dial loop recover from a
-// single transient blip without us crash-looping the sidecar.
-const eventPlaneFailureTolerance = 3
-
 // runEntityChecker runs the periodic check against the Asterisk entity id and
 // acts as the liveness watchdog for the native ARI event plane.
 //
-// The HTTP control plane (Asterisk().Info) and the event websocket are
-// independent: the event socket can silently half-die (no StasisStart events
-// reach NATS) while Info() keeps succeeding, with no recovery, until the sidecar
-// is restarted. To guard that, in addition to verifying the entity id we treat a
-// lost event-websocket connection (native Client.Connected() == false) as a
-// failure. We only os.Exit(1) after eventPlaneFailureTolerance consecutive
-// failing ticks so a single transient blip — which the native client's own
-// re-dial loop will heal — does not crash-loop the process. On exit, Kubernetes
-// (or systemd with Restart=on-failure) restarts the sidecar, which re-opens the
-// websocket and resumes publishing.
+// The HTTP control plane and the event websocket are independent, and the
+// native client reports Connected() while a half-open websocket read is
+// blocked. So the watchdog proves delivery positively: each tick it sends a
+// nonce-tagged user event to this application and expects it back over the
+// event websocket by the next tick. A probe that does not come back is a
+// confirmed event-plane failure; the process exits non-zero so its supervisor
+// restarts it with a fresh websocket.
 func (s *Server) runEntityChecker(ctx context.Context) {
 	ticker := time.NewTicker(proxy.EntityCheckInterval)
 	defer ticker.Stop()
-
-	var eventPlaneFailures int
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			info, err := s.ari.Asterisk().Info(nil)
-			if err != nil {
-				s.Log.Error("failed to get info from Asterisk", "error", err)
-				continue
-			}
-			if s.AsteriskID != info.SystemInfo.EntityID {
-				s.Log.Warn("system entitiy id changed", "old", s.AsteriskID, "new", info.SystemInfo.EntityID)
-				// We need to exit with non-zero to make sure systemd restarts when service defined with Restart=on-failure
-				os.Exit(1)
-			}
-
-			// Event-plane liveness check. Connected() reflects the health of the
-			// native event websocket; when it goes false the event pipeline is
-			// down and no events are reaching NATS.
-			if s.ari.Connected() {
-				if eventPlaneFailures > 0 {
-					s.Log.Info("ARI event websocket recovered", "failures", eventPlaneFailures)
-				}
-				eventPlaneFailures = 0
-				continue
-			}
-
-			eventPlaneFailures++
-			s.Log.Warn("ARI event websocket reports disconnected",
-				"failures", eventPlaneFailures,
-				"tolerance", eventPlaneFailureTolerance,
-				"lastEventAgo", s.timeSinceLastEvent())
-			if eventPlaneFailures >= eventPlaneFailureTolerance {
-				s.Log.Error("ARI event plane down for sustained period; exiting so the sidecar is restarted",
-					"failures", eventPlaneFailures)
-				// Non-zero exit so Kubernetes/systemd restarts the sidecar, which
-				// re-opens the event websocket and resumes publishing to NATS.
-				os.Exit(1)
+			if !s.checkHealth(ctx) {
+				s.exitProcess(1)
+				return
 			}
 		}
 	}
+}
+
+// checkHealth runs one watchdog tick. It returns false on a confirmed failure.
+func (s *Server) checkHealth(ctx context.Context) bool {
+	info, err := s.ari.Asterisk().Info(nil)
+	if err != nil {
+		s.Log.Error("failed to get info from Asterisk", "error", err)
+	} else if s.AsteriskID != info.SystemInfo.EntityID {
+		s.Log.Error("system entity id changed; exiting so the sidecar is restarted", "old", s.AsteriskID, "new", info.SystemInfo.EntityID)
+		return false
+	}
+
+	if s.prober == nil {
+		return true
+	}
+	if !s.liveness.answered() {
+		s.Log.Error("ARI event websocket did not deliver the liveness probe; exiting so the sidecar is restarted",
+			"lastEventAgo", s.timeSinceLastEvent())
+		return false
+	}
+	nonce := rid.New("")
+	s.liveness.expect(nonce)
+	probeCtx, cancel := context.WithTimeout(ctx, proxy.EntityCheckInterval)
+	defer cancel()
+	if err := s.prober.Probe(probeCtx, nonce); err != nil {
+		// A probe that was never sent says nothing about event delivery.
+		s.liveness.clear()
+		s.Log.Warn("failed to send ARI liveness probe", "error", err)
+	}
+	return true
+}
+
+// exitProcess ends the process so its supervisor restarts the sidecar.
+func (s *Server) exitProcess(code int) {
+	if s.exit != nil {
+		s.exit(code)
+		return
+	}
+	os.Exit(code)
 }
 
 // timeSinceLastEvent returns how long ago the last ARI event was received, for
@@ -381,16 +399,12 @@ func (s *Server) announce() {
 	})
 }
 
-// runEventHandler processes events which are received from ARI.
-//
-// If the underlying subscription channel is ever closed (which can happen if the
-// event websocket is torn down), we re-subscribe in place rather than spinning on
-// a permanently-closed channel. This is the preferred low-risk self-heal for the
-// event plane; the runEntityChecker watchdog is the backstop for a websocket that
-// half-dies without ever closing this channel.
+// runEventHandler processes events which are received from ARI. A closed
+// subscription channel while the server is running is a confirmed event-plane
+// failure: the process exits so its supervisor restarts it.
 func (s *Server) runEventHandler(ctx context.Context) {
 	sub := s.ari.Bus().Subscribe(nil, ari.Events.All)
-	defer func() { sub.Cancel() }()
+	defer sub.Cancel()
 
 	for {
 		s.Log.Debug("listening for events", "application", s.Application)
@@ -399,30 +413,40 @@ func (s *Server) runEventHandler(ctx context.Context) {
 			return
 		case e, ok := <-sub.Events():
 			if !ok {
-				// The subscription channel was closed; re-subscribe so we keep
-				// publishing events instead of busy-looping on a dead channel.
-				s.Log.Warn("ARI event subscription channel closed; re-subscribing")
-				sub.Cancel()
-				sub = s.ari.Bus().Subscribe(nil, ari.Events.All)
-				continue
+				if ctx.Err() != nil {
+					return
+				}
+				s.Log.Error("ARI event subscription closed; exiting so the sidecar is restarted")
+				s.exitProcess(1)
+				return
 			}
-			s.lastEventAt.Store(time.Now().UnixNano())
-			s.Log.Debug("event received", "kind", e.GetType())
-
-			// Publish event to canonical destination
-			s.publishEvent(fmt.Sprintf("%sevent.%s.%s", s.MBPrefix, s.Application, s.AsteriskID), e)
-
-			// Unbind dialogs once their entity has ended, so bindings do not leak.
-			s.cleanupDialogsForEvent(e)
-
-			// Publish event to any associated dialogs
-			for _, d := range s.dialogsForEvent(e) {
-				de := e
-				de.SetDialog(d)
-				s.publishEvent(fmt.Sprintf("%sdialogevent.%s", s.MBPrefix, d), de)
-			}
+			s.handleEvent(e)
 		}
 	}
+}
+
+// handleEvent publishes one ARI event. Dialog subscribers receive it before
+// the entity that ended, if any, is unbound, so they see its final event.
+func (s *Server) handleEvent(e ari.Event) {
+	s.lastEventAt.Store(time.Now().UnixNano())
+	if nonce, ok := livenessNonce(e); ok {
+		s.liveness.observe(nonce)
+		return
+	}
+	s.Log.Debug("event received", "kind", e.GetType())
+
+	// Publish event to canonical destination
+	s.publishEvent(fmt.Sprintf("%sevent.%s.%s", s.MBPrefix, s.Application, s.AsteriskID), e)
+
+	// Publish event to any associated dialogs
+	for _, d := range s.dialogsForEvent(e) {
+		de := e
+		de.SetDialog(d)
+		s.publishEvent(fmt.Sprintf("%sdialogevent.%s", s.MBPrefix, d), de)
+	}
+
+	// Unbind dialogs once their entity has ended, so bindings do not leak.
+	s.cleanupDialogsForEvent(e)
 }
 
 // pingHandler publishes the server's presence
