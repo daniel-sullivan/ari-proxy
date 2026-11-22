@@ -46,4 +46,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/CyCoreSystems/ari/v5 => github.com/daniel-sullivan/ari/v5 v5.3.2-0.20260312051653-3faec98e5b75
+replace github.com/CyCoreSystems/ari/v5 => github.com/daniel-sullivan/ari/v5 v5.3.2-0.20261122090200-e44461809992
