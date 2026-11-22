@@ -5,7 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CyCoreSystems/ari-proxy/v5/server/dialog"
+	"github.com/CyCoreSystems/ari/v5"
+	"github.com/CyCoreSystems/ari/v5/client/arimocks"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 func TestWatchdogTickWithInfoInFlight(t *testing.T) {
@@ -44,4 +48,38 @@ func TestWatchdogTickWithInfoInFlight(t *testing.T) {
 			assert.Equal(t, tt.wantCodes, codes)
 		})
 	}
+}
+
+// TestWatchdogTickCancelWakesInfoWait keeps the liveness window open, so only
+// cancellation can wake the info wait.
+func TestWatchdogTickCancelWakesInfoWait(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	ast := &arimocks.Asterisk{}
+	ast.On("Info", (*ari.Key)(nil)).Run(func(mock.Arguments) {
+		close(entered)
+		<-release
+	}).Return(&ari.AsteriskInfo{}, nil).Once()
+	native := &arimocks.Client{}
+	native.On("Asterisk").Return(ast)
+	s := testServer(native, &recordingBus{})
+	s.Dialog = dialog.NewMemManager()
+	s.Prober = &fakeProber{}
+	s.now = (&fakeClock{now: time.Unix(1_800_000_000, 0)}).Now
+	s.after = neverFires
+	var codes []int
+	s.exit = func(code int) { codes = append(codes, code) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan bool)
+	go func() { done <- s.watchdogTick(ctx) }()
+
+	<-entered
+	cancel()
+
+	assert.False(t, <-done)
+	assert.Empty(t, codes)
 }
