@@ -54,6 +54,16 @@ func newUserEventProber(opts *native.Options, application string) *ariUserEventP
 	}
 }
 
+// proberFor builds the round-trip prober for a supplied ARI client from the
+// client's own settings. Only the native client exposes them.
+func proberFor(a ari.Client) (LivenessProber, error) {
+	nc, ok := a.(*native.Client)
+	if !ok || nc.Options == nil {
+		return nil, errors.New("ListenOn needs a Prober for a non-native ARI client")
+	}
+	return newUserEventProber(nc.Options, a.ApplicationName()), nil
+}
+
 func (p *ariUserEventProber) Probe(ctx context.Context, nonce string) error {
 	target := fmt.Sprintf("%s/events/user/%s?application=%s",
 		strings.TrimRight(p.baseURL, "/"), livenessEventName, url.QueryEscape(p.application))

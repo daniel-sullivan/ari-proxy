@@ -71,6 +71,9 @@ type Server struct {
 	// now reads the clock; nil means time.Now.
 	now func() time.Time
 
+	// after starts a timer; nil means time.After.
+	after func(d time.Duration) <-chan time.Time
+
 	// ManagerMediaHost is the manager membership DNS name used to validate
 	// ExternalMedia peers. It defaults to the ARI_PROXY_MANAGER_MEDIA_HOST
 	// environment variable.
@@ -140,8 +143,19 @@ func (s *Server) Listen(ctx context.Context, ariOpts *native.Options, messagebus
 	return s.listen(ctx)
 }
 
-// ListenOn runs the given server, listening on the provided ARI and NATS connections
+// ListenOn runs the given server, listening on the provided ARI and NATS
+// connections. Event-plane liveness always uses a round-trip prober: for a
+// native client one is built from the client's own ARI settings, and any
+// other client needs a caller-supplied Prober.
 func (s *Server) ListenOn(ctx context.Context, a ari.Client, n *nats.EncodedConn) error {
+	if s.Prober == nil {
+		p, err := proberFor(a)
+		if err != nil {
+			return err
+		}
+		s.Prober = p
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
@@ -303,29 +317,34 @@ func (s *Server) runEntityChecker(ctx context.Context) {
 
 // checkHealth runs one watchdog tick. It returns false on a confirmed failure.
 func (s *Server) checkHealth(ctx context.Context) bool {
-	info, err := s.ari.Asterisk().Info(nil)
-	if err != nil {
+	if s.Prober == nil {
+		s.Log.Error("no ARI liveness prober configured; exiting so the sidecar is restarted")
+		return false
+	}
+
+	// The outstanding probe is judged first, so nothing below can delay a
+	// confirmed event-plane failure.
+	state := s.liveness.state(s.clock(), livenessDeliveryWindow)
+	if state == probeLost {
+		s.Log.Error("ARI event websocket did not deliver the liveness probe; exiting so the sidecar is restarted",
+			"lastEventAgo", s.timeSinceLastEvent())
+		return false
+	}
+
+	info, err := s.infoWithinWindow()
+	switch {
+	case errors.Is(err, errInfoDeadline):
+		s.Log.Error("Asterisk info request did not complete within the liveness window; exiting so the sidecar is restarted")
+		return false
+	case err != nil:
 		s.Log.Error("failed to get info from Asterisk", "error", err)
-	} else if s.AsteriskID != info.SystemInfo.EntityID {
+	case s.AsteriskID != info.SystemInfo.EntityID:
 		s.Log.Error("system entity id changed; exiting so the sidecar is restarted", "old", s.AsteriskID, "new", info.SystemInfo.EntityID)
 		return false
 	}
 
-	if s.Prober == nil {
-		if !s.ari.Connected() {
-			s.Log.Error("ARI client reports disconnected; exiting so the sidecar is restarted")
-			return false
-		}
+	if state == probeAwaiting {
 		return true
-	}
-
-	switch s.liveness.state(s.clock(), livenessDeliveryWindow) {
-	case probeAwaiting:
-		return true
-	case probeLost:
-		s.Log.Error("ARI event websocket did not deliver the liveness probe; exiting so the sidecar is restarted",
-			"lastEventAgo", s.timeSinceLastEvent())
-		return false
 	}
 
 	nonce := rid.New("")
@@ -345,6 +364,38 @@ func (s *Server) checkHealth(ctx context.Context) bool {
 		s.Log.Warn("failed to send ARI liveness probe", "error", err)
 	}
 	return true
+}
+
+// errInfoDeadline reports an Asterisk info request still unanswered when the
+// liveness window closed.
+var errInfoDeadline = errors.New("asterisk info request exceeded the liveness window")
+
+// infoWithinWindow runs the Asterisk info request with the liveness window as its
+// deadline. The native client's request takes no context, so a request that
+// hangs is abandoned; the watchdog then ends the process.
+func (s *Server) infoWithinWindow() (*ari.AsteriskInfo, error) {
+	type result struct {
+		info *ari.AsteriskInfo
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		info, err := s.ari.Asterisk().Info(nil)
+		done <- result{info: info, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.info, r.err
+	case <-s.timer(livenessDeliveryWindow):
+		return nil, errInfoDeadline
+	}
+}
+
+func (s *Server) timer(d time.Duration) <-chan time.Time {
+	if s.after != nil {
+		return s.after(d)
+	}
+	return time.After(d)
 }
 
 func (s *Server) clock() time.Time {
